@@ -15,10 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Prefetch docker images
-        run: |
-          docker pull stelzo/doduda-umbu:amd64
-          docker pull stelzo/assetstudio-cli:amd64
       - name: Get doduda
         env:
           GH_TOKEN: ${{ github.token }}
