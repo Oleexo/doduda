@@ -57,9 +57,9 @@ func detectRawDataMajorVersion(dir string) (int, error) {
 	return 0, errors.New("Could not detect major version of raw data")
 }
 
-// normalizeUnityRIDTypes copies JSON files from dir to dstDir, rewriting any
-// "rid" numeric values to strings required by the mapping package. The source
-// files in dir are left untouched.
+// normalizeUnityRIDTypes copies Unity JSON files from dir to dstDir, rewriting
+// any "rid" numeric values to strings required by the mapping package. The
+// source files in dir are left untouched.
 func normalizeUnityRIDTypes(dir string, dstDir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -101,6 +101,43 @@ func normalizeUnityRIDTypes(dir string, dstDir string) error {
 		dstPath := filepath.Join(dstDir, entry.Name())
 		if err := os.WriteFile(dstPath, output, os.ModePerm); err != nil {
 			return fmt.Errorf("write %s: %w", entry.Name(), err)
+		}
+	}
+
+	if err := copyUnityLanguageFiles(dir, dstDir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func copyUnityLanguageFiles(dir string, dstDir string) error {
+	srcLangDir := filepath.Join(dir, "languages")
+	entries, err := os.ReadDir(srcLangDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	dstLangDir := filepath.Join(dstDir, "languages")
+	if err := os.MkdirAll(dstLangDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+
+		content, err := os.ReadFile(filepath.Join(srcLangDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+
+		if err := os.WriteFile(filepath.Join(dstLangDir, entry.Name()), content, os.ModePerm); err != nil {
+			return err
 		}
 	}
 

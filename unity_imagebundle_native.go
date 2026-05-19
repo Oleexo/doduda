@@ -189,7 +189,7 @@ func unityDecodeTextureImage(texture *uni.Texture2D, hintWidth int, hintHeight i
 		if size <= 0 || size > len(raw) {
 			size = len(raw)
 		}
-		if err := dds.DecompressBC7(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
+		if _, err := dds.DecompressBC7(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
 			return nil, err
 		}
 		return unityFlipVerticalNRGBA(decoded), nil
