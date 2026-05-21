@@ -273,5 +273,6 @@
     "Release a group of monsters",
     "Unlocks a body",
     "Unlocks a pose",
-    "Fight: (level)"
+    "Fight: (level)",
+    ": - Minimum Range"
 ]
