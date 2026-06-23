@@ -271,5 +271,7 @@
     "Manger Gauge + (max)",
     "Drinking Trough Gauge + (max)",
     "Fight: (level)",
-    "Unlocks a body"
+    "Unlocks a body",
+    "An item's value",
+    ": - Minimum Range"
 ]
