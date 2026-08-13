@@ -86,3 +86,5 @@ require (
 	golang.org/x/time v0.11.0 // indirect
 	gotest.tools/v3 v3.5.1 // indirect
 )
+
+replace github.com/kvarenzn/ssm => github.com/Oleexo/ssm v0.3.2-dofus3

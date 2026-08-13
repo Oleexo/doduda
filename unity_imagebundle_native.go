@@ -14,6 +14,8 @@ import (
 	"charm.land/log/v2"
 	"github.com/kvarenzn/ssm/uni"
 	"github.com/xypwn/filediver/dds"
+
+	"github.com/dofusdude/doduda/internal/crunch"
 )
 
 func unpackUnityImagesNative(inputDir string, outputDir string) error {
@@ -219,6 +221,38 @@ func unityDecodeTextureImage(texture *uni.Texture2D, hintWidth int, hintHeight i
 		}
 		if _, err := dds.DecompressDXT5(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
 			return nil, err
+		}
+		return unityFlipVerticalNRGBA(decoded), nil
+	case uni.DXT1:
+		decoded := image.NewNRGBA(image.Rect(0, 0, meta.width, meta.height))
+		size := meta.completeSize
+		if size <= 0 || size > len(raw) {
+			size = len(raw)
+		}
+		if _, err := dds.DecompressDXT1(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
+			return nil, err
+		}
+		return unityFlipVerticalNRGBA(decoded), nil
+	case uni.DXT1Crunched, uni.DXT5Crunched:
+		// Unity's own fork of Rich Geldreich's crunch format: an additional compression layer on
+		// top of plain DXT1/DXT5 block data (codebooks + Huffman, not a block format itself -- no
+		// pure-Go decoder exists anywhere, every other Unity-asset tool wraps the same native
+		// library). raw here is the whole crunch-compressed blob, not sized DXT block data, so it
+		// skips the completeSize truncation the other cases use -- crunch.Decode consumes the
+		// entire blob itself and returns exactly the right amount of real DXTn block bytes.
+		dxtBytes, err := crunch.Decode(raw, 0)
+		if err != nil {
+			return nil, fmt.Errorf("crunch decode: %w", err)
+		}
+		decoded := image.NewNRGBA(image.Rect(0, 0, meta.width, meta.height))
+		var decompressErr error
+		if meta.format == uni.DXT1Crunched {
+			_, decompressErr = dds.DecompressDXT1(decoded.Pix, bytes.NewReader(dxtBytes), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel})
+		} else {
+			_, decompressErr = dds.DecompressDXT5(decoded.Pix, bytes.NewReader(dxtBytes), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel})
+		}
+		if decompressErr != nil {
+			return nil, decompressErr
 		}
 		return unityFlipVerticalNRGBA(decoded), nil
 	default:
