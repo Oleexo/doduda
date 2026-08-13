@@ -69,6 +69,24 @@ var (
 		Run:           renderCommand,
 		Args:          cobra.ExactArgs(3),
 	}
+
+	extractCmd = &cobra.Command{
+		Use:   "extract",
+		Short: "Download and unpack an arbitrary file from any manifest fragment, or list fragments/files.",
+		Long: `Generic escape hatch alongside the built-in --ignore categories: pull any single bundle
+(or a REGEX: matched set) out of any manifest fragment -- including fragments with no dedicated
+category yet, like 'win32_x64'/'darwin' (game client UI chrome) or 'animations' (prop sprites) --
+and run it through the same image or data decoder the categories use. No code change or rebuild
+needed to try a new bundle.
+
+Use --list with no --fragment to see every fragment and its size. Use --list --fragment <name>
+(optionally with --file to narrow it) to see the files inside one fragment, without downloading
+anything.`,
+		SilenceErrors: true,
+		SilenceUsage:  false,
+		Run:           extractCommand,
+		Args:          cobra.NoArgs,
+	}
 )
 
 func main() {
@@ -172,6 +190,14 @@ Regex example:
 	renderCmd.Flags().String("incremental", "", "Start from the last version and only render missing images. The format must be <owner>/<repo>/<filename>")
 	rootCmd.AddCommand(renderCmd)
 
+	extractCmd.Flags().String("fragment", "", "Manifest fragment to read from, e.g. 'picto', 'animations', 'win32_x64' (windows client) / 'darwin' (macos client).")
+	extractCmd.Flags().String("file", "", "Manifest file path to extract, or 'REGEX:<pattern>' to match multiple. Required unless --list.")
+	extractCmd.Flags().String("out", "", "Output directory. Required unless --list.")
+	extractCmd.Flags().String("as", "image", "Decoder to use: 'image' (Sprite/Texture2D -> PNG) or 'data' (single MonoBehaviour -> JSON).")
+	extractCmd.Flags().Bool("list", false, "List fragments (no --fragment), or files in --fragment matching --file. Does not download.")
+	extractCmd.Flags().Int32("bin", 500, "Divide the files into smaller bins of the given size in Megabyte to reduce overall memory usage. Disable binning with -1.")
+	rootCmd.AddCommand(extractCmd)
+
 	rootCmd.AddCommand(versionCmd)
 
 	err = rootCmd.Execute()
@@ -226,6 +252,113 @@ func renderCommand(ccmd *cobra.Command, args []string) {
 
 	err = Render(inputDir, outputDir, incrementalParts, resolution, headless)
 	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func extractCommand(ccmd *cobra.Command, args []string) {
+	list, err := ccmd.Flags().GetBool("list")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fragment, err := ccmd.Flags().GetString("fragment")
+	if err != nil {
+		log.Fatal(err)
+	}
+	file, err := ccmd.Flags().GetString("file")
+	if err != nil {
+		log.Fatal(err)
+	}
+	out, err := ccmd.Flags().GetString("out")
+	if err != nil {
+		log.Fatal(err)
+	}
+	as, err := ccmd.Flags().GetString("as")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	gameRelease, err := ccmd.Flags().GetString("release")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	platform, err := ccmd.Flags().GetString("platform")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if platform == "macos" {
+		platform = "darwin"
+	}
+	supportedPlatforms := []string{"windows", "darwin", "linux"}
+	if !contains(supportedPlatforms, platform) {
+		log.Fatalf("Platform %s is not supported", platform)
+	}
+
+	manifestFlag, err := ccmd.Flags().GetString("manifest")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	clean, err := ccmd.Flags().GetBool("cache-ignore")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	version, err := ccmd.Flags().GetString("dofus-version")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	bin, err := ccmd.Flags().GetInt32("bin")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	headless, err := ccmd.Flags().GetBool("headless")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	outputFlag, err := ccmd.Flags().GetString("output")
+	if err != nil {
+		log.Fatal(err)
+	}
+	dir := parseWd(outputFlag)
+
+	manifest, _, err := LoadManifest(gameRelease, version, platform, dir, manifestFlag, clean, headless)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if list {
+		if fragment == "" {
+			if err := ListFragments(manifest); err != nil {
+				log.Fatal(err)
+			}
+			return
+		}
+		pattern := file
+		if pattern == "" {
+			pattern = "REGEX:.*"
+		}
+		if err := ListFiles(manifest, fragment, pattern); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if fragment == "" {
+		log.Fatal("--fragment is required")
+	}
+	if file == "" {
+		log.Fatal("--file is required (or pass --list to browse first)")
+	}
+	if out == "" {
+		log.Fatal("--out is required")
+	}
+
+	if err := Extract(manifest, fragment, file, out, as, int(bin), headless); err != nil {
 		log.Fatal(err)
 	}
 }

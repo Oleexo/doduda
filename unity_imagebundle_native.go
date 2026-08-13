@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"charm.land/log/v2"
 	"github.com/kvarenzn/ssm/uni"
 	"github.com/xypwn/filediver/dds"
 )
@@ -42,7 +43,13 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 	}
 
 	assetsManager := uni.NewAssetsManager()
-	if err := assetsManager.LoadDataFromHandler(data, filepath.Base(inputPath)); err != nil {
+	// uni's own LoadDataFromHandler only understands LZ4/uncompressed UnityFS blocks and errors
+	// with "LZMA unsupported" on bundles that use LZMA compression (observed on
+	// Content/Animations/Props/*.bundle). loadUnityAssetFilesNative (unity_bundle_native.go) is
+	// doduda's own UnityFS container parser, written for the data-bundle path specifically because
+	// it needs LZMA support uni.LoadDataFromHandler doesn't have -- reuse it here instead of
+	// duplicating a second container parser.
+	if err := loadUnityAssetFilesNative(data, inputPath, assetsManager); err != nil {
 		return err
 	}
 
@@ -83,7 +90,14 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 
 			spriteImage, err := unityDecodeSpriteImage(sprite, textureCache)
 			if err != nil {
-				return fmt.Errorf("decode sprite %q: %w", sprite.Name, err)
+				// One malformed/unsupported sprite (an unusual texture format, a metadata
+				// mismatch on an outlier asset, ...) used to abort the whole bundle here,
+				// throwing away every other sprite that decoded fine -- observed on a 16 MB
+				// bundle with thousands of good sprites and exactly one bad one. Skip and keep
+				// going instead; the caller sees the miss via this warning and the output file
+				// count coming up short of the sprite count.
+				log.Warnf("skip sprite %q: %s", sprite.Name, err)
+				continue
 			}
 
 			var textureName string
@@ -126,7 +140,8 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 
 			textureImage, err := unityDecodeTextureImage(texture, 0, 0)
 			if err != nil {
-				return fmt.Errorf("decode texture %q: %w", texture.Name, err)
+				log.Warnf("skip texture %q: %s", texture.Name, err)
+				continue
 			}
 
 			outputName := unityOutputImageName(texture.Name, unityObjectFallbackName(texture.GetObject()))
@@ -190,6 +205,19 @@ func unityDecodeTextureImage(texture *uni.Texture2D, hintWidth int, hintHeight i
 			size = len(raw)
 		}
 		if _, err := dds.DecompressBC7(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
+			return nil, err
+		}
+		return unityFlipVerticalNRGBA(decoded), nil
+	case uni.DXT5:
+		// Same shape as the BC7 case above: uni.DecodeTexture2D has no DXT/BC1-5 support at all
+		// (decode_texture2d.go only implements Alpha8/RGB24/RGBA32/ARGB32/ETC/ASTC), but the dds
+		// package doduda already imports for BC7 also implements DXT5 -- just wasn't wired in yet.
+		decoded := image.NewNRGBA(image.Rect(0, 0, meta.width, meta.height))
+		size := meta.completeSize
+		if size <= 0 || size > len(raw) {
+			size = len(raw)
+		}
+		if _, err := dds.DecompressDXT5(decoded.Pix, bytes.NewReader(raw[:size]), meta.width, meta.height, dds.Info{ColorModel: color.NRGBAModel}); err != nil {
 			return nil, err
 		}
 		return unityFlipVerticalNRGBA(decoded), nil

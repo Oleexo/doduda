@@ -274,7 +274,13 @@ func humanFileSize(bytes float64, decimal bool, precision int) string {
 	return fmt.Sprintf("%.*f %s", precision, bytes, units[u])
 }
 
-func Download(releaseChannel string, version string, dir string, clean bool, fullGame bool, platform string, bin int, manifest string, jobs int, ignore []string, indent string, headless bool) error {
+// LoadManifest resolves the Ankama manifest for releaseChannel/version/platform, either from a
+// cached/explicit manifest file (manifestFlag, or the default "manifest.json" next to the working
+// directory) or by fetching it fresh from Ankama's cytrus CDN when none is cached, clean is set, or
+// the requested version differs from "latest". It returns the parsed manifest and the resolved
+// Dofus version string (e.g. "3.6.10.10"). Extracted out of Download so Extract can reuse the same
+// fetch/cache logic without downloading or unpacking any game content.
+func LoadManifest(releaseChannel string, version string, platform string, dir string, manifestFlag string, clean bool, headless bool) (*ankabuffer.Manifest, string, error) {
 	var ankaManifest ankabuffer.Manifest
 	manifestSearchPath := "manifest.json"
 
@@ -292,21 +298,22 @@ func Download(releaseChannel string, version string, dir string, clean bool, ful
 	feedbacks <- "⬇️"
 
 	var manifestPath string
-	if manifest == "" {
+	if manifestFlag == "" {
 		if _, err := os.Stat(manifestSearchPath); os.IsNotExist(err) {
 			manifestPath = ""
 		} else {
-			manifestPath, err = filepath.Abs(manifestSearchPath)
-			if err != nil {
-				log.Fatal(err)
+			var err2 error
+			manifestPath, err2 = filepath.Abs(manifestSearchPath)
+			if err2 != nil {
+				log.Fatal(err2)
 			}
 		}
 	} else {
-		var err error
-		if _, err := os.Stat(manifest); os.IsNotExist(err) {
+		if _, err := os.Stat(manifestFlag); os.IsNotExist(err) {
 			log.Fatal(err)
 		}
-		manifestPath, err = filepath.Abs(manifest)
+		var err error
+		manifestPath, err = filepath.Abs(manifestFlag)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -320,7 +327,7 @@ func Download(releaseChannel string, version string, dir string, clean bool, ful
 			var err error
 			version, err = GetLatestLauncherVersion(releaseChannel)
 			if err != nil {
-				return err
+				return nil, "", err
 			}
 		} else {
 			// ATT: prefix changes with cytrus updates
@@ -333,7 +340,7 @@ func Download(releaseChannel string, version string, dir string, clean bool, ful
 
 		rawManifest, err := GetReleaseManifest(version, releaseChannel, platform, dir)
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 
 		feedbacks <- "parsing"
@@ -369,11 +376,6 @@ func Download(releaseChannel string, version string, dir string, clean bool, ful
 		dofusVersion = ankaManifest.GameVersion
 	}
 
-	rawDofusMajorVersion, err := strconv.Atoi(strings.Split(dofusVersion, ".")[0])
-	if err != nil {
-		log.Fatal("Invalid version")
-	}
-
 	betaSuffix := ""
 	if strings.Contains(releaseChannel, "beta") {
 		betaSuffix = " [beta]"
@@ -382,6 +384,21 @@ func Download(releaseChannel string, version string, dir string, clean bool, ful
 
 	close(feedbacks)
 	manifestWg.Wait()
+
+	return &ankaManifest, dofusVersion, nil
+}
+
+func Download(releaseChannel string, version string, dir string, clean bool, fullGame bool, platform string, bin int, manifest string, jobs int, ignore []string, indent string, headless bool) error {
+	ankaManifestPtr, dofusVersion, err := LoadManifest(releaseChannel, version, platform, dir, manifest, clean, headless)
+	if err != nil {
+		return err
+	}
+	ankaManifest := *ankaManifestPtr
+
+	rawDofusMajorVersion, err := strconv.Atoi(strings.Split(dofusVersion, ".")[0])
+	if err != nil {
+		log.Fatal("Invalid version")
+	}
 
 	if fullGame {
 		var fullGameUiWg sync.WaitGroup
