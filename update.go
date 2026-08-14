@@ -956,9 +956,11 @@ func DownloadUnpackFiles(title string, bin int, manifest *ankabuffer.Manifest, f
 
 				if unpack {
 					Unpack(offlineFilePath, dir, destDir, title, indent, muteSpinner, silent)
-					err := os.Remove(offlineFilePath)
-					if err != nil {
-						log.Fatal(err)
+					if os.Getenv("DODUDA_KEEP_BUNDLES") == "" {
+						err := os.Remove(offlineFilePath)
+						if err != nil {
+							log.Fatal(err)
+						}
 					}
 				}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -82,6 +83,13 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 
 	textureCache := make(map[*uni.Texture2D]image.Image)
 	nameStates := make(map[string]*unityNameState)
+	// Textures already consumed by at least one sprite crop. Without this, the whole-Texture2D
+	// pass below would additionally dump the raw, uncropped atlas for every texture a sprite
+	// already covered -- redundant at best (a full 4096x4096 atlas next to its own cropped
+	// pieces), and before cropping was added this only looked harmless because the atlas dump
+	// happened to be byte-identical to the sprite dump.
+	usedTextures := make(map[*uni.Texture2D]bool)
+	var spriteMetas []unitySpriteMeta
 
 	for _, assetFile := range assetsManager.AssetFiles {
 		for _, object := range assetFile.Objects {
@@ -90,7 +98,7 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 				continue
 			}
 
-			spriteImage, err := unityDecodeSpriteImage(sprite, textureCache)
+			spriteImage, atlasTexture, atlasBounds, err := unityDecodeSpriteImage(sprite, textureCache)
 			if err != nil {
 				// One malformed/unsupported sprite (an unusual texture format, a metadata
 				// mismatch on an outlier asset, ...) used to abort the whole bundle here,
@@ -101,13 +109,7 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 				log.Warnf("skip sprite %q: %s", sprite.Name, err)
 				continue
 			}
-
-			var textureName string
-			if sprite.RenderData != nil && sprite.RenderData.Texture != nil {
-				if texture, ok := sprite.RenderData.Texture.Get().(*uni.Texture2D); ok && texture != nil {
-					textureName = texture.Name
-				}
-			}
+			usedTextures[atlasTexture] = true
 
 			outputName := unityOutputImageName(sprite.Name, unityObjectFallbackName(sprite.GetObject()))
 			outputPath := unityNextImagePath(targetDir, outputName, spriteImage, nameStates, layerOrder)
@@ -115,17 +117,13 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 				return err
 			}
 
-			// AssetStudio occasionally names the emitted file after the linked texture
-			// instead of the sprite object. Export both aliases when they differ.
-			if len(layerOrder) == 0 && textureName != "" {
-				textureAliasName := unityOutputImageName(textureName, unityObjectFallbackName(sprite.GetObject()))
-				if textureAliasName != outputName {
-					textureAliasPath := unityNextImagePath(targetDir, textureAliasName, spriteImage, nameStates, layerOrder)
-					if err := unityWritePNG(textureAliasPath, spriteImage); err != nil {
-						return err
-					}
-				}
-			}
+			spriteMetas = append(spriteMetas, unitySpriteMetaFrom(sprite, atlasTexture, atlasBounds, outputPath, targetDir))
+		}
+	}
+
+	if len(spriteMetas) > 0 {
+		if err := unityWriteSpriteSidecar(filepath.Base(inputPath), targetDir, spriteMetas); err != nil {
+			return err
 		}
 	}
 
@@ -136,7 +134,7 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 	for _, assetFile := range assetsManager.AssetFiles {
 		for _, object := range assetFile.Objects {
 			texture, ok := object.(*uni.Texture2D)
-			if !ok {
+			if !ok || usedTextures[texture] {
 				continue
 			}
 
@@ -157,32 +155,221 @@ func unpackUnityImageBundleNative(inputPath string, outputDir string) error {
 	return nil
 }
 
-func unityDecodeSpriteImage(sprite *uni.Sprite, textureCache map[*uni.Texture2D]image.Image) (image.Image, error) {
+// unityDecodeSpriteImage decodes (and caches) the sprite's backing atlas texture, then crops out
+// just the sprite's own sub-rectangle -- sprite.RenderData.TextureRect -- instead of returning the
+// whole shared atlas. Before this, every sprite packed into the same atlas produced an identical
+// full-texture PNG (a 4096x4096 sheet with dozens of unrelated objects on it, ~15-30% opaque,
+// observed on every Content/Animations/Props bundle); TextureRect was read only as a width/height
+// hint to disambiguate the texture's own field layout, never as a crop box. Returns the atlas
+// texture and its pixel bounds alongside the crop so the caller can build sidecar metadata and
+// dedupe the separate whole-Texture2D export pass against textures already covered by a sprite.
+func unityDecodeSpriteImage(sprite *uni.Sprite, textureCache map[*uni.Texture2D]image.Image) (image.Image, *uni.Texture2D, image.Rectangle, error) {
 	if sprite == nil || sprite.RenderData == nil || sprite.RenderData.Texture == nil {
-		return nil, fmt.Errorf("sprite has no render data texture")
+		return nil, nil, image.Rectangle{}, fmt.Errorf("sprite has no render data texture")
 	}
 
 	textureObject, ok := sprite.RenderData.Texture.Get().(*uni.Texture2D)
 	if !ok || textureObject == nil {
-		return nil, fmt.Errorf("sprite texture reference is not a Texture2D")
+		return nil, nil, image.Rectangle{}, fmt.Errorf("sprite texture reference is not a Texture2D")
 	}
 
-	textureImage, ok := textureCache[textureObject]
+	atlasImage, ok := textureCache[textureObject]
 	if !ok {
 		var err error
 		hintWidth, hintHeight := 0, 0
-		if sprite.RenderData != nil && sprite.RenderData.TextureRect != nil {
+		if sprite.RenderData.TextureRect != nil {
 			hintWidth = int(math.Round(float64(sprite.RenderData.TextureRect.Width)))
 			hintHeight = int(math.Round(float64(sprite.RenderData.TextureRect.Height)))
 		}
-		textureImage, err = unityDecodeTextureImage(textureObject, hintWidth, hintHeight)
+		atlasImage, err = unityDecodeTextureImage(textureObject, hintWidth, hintHeight)
 		if err != nil {
-			return nil, err
+			return nil, nil, image.Rectangle{}, err
 		}
-		textureCache[textureObject] = textureImage
+		textureCache[textureObject] = atlasImage
 	}
 
-	return textureImage, nil
+	atlasBounds := atlasImage.Bounds()
+
+	rect := sprite.RenderData.TextureRect
+	if rect == nil || rect.Width <= 0 || rect.Height <= 0 {
+		return nil, nil, image.Rectangle{}, fmt.Errorf("sprite has no usable texture rect")
+	}
+
+	atlasNRGBA, ok := atlasImage.(*image.NRGBA)
+	if !ok {
+		return nil, nil, image.Rectangle{}, fmt.Errorf("atlas texture decoded to unsupported image type %T", atlasImage)
+	}
+
+	// Unity texture space is bottom-left origin (V increases upward); the decoded atlas image
+	// (already flipped top-down by unityFlipVerticalNRGBA in unityDecodeTextureImage) is top-left
+	// origin like every Go image, so the rect's Y needs flipping to locate it in the decoded image.
+	left := int(math.Round(float64(rect.X)))
+	width := int(math.Round(float64(rect.Width)))
+	height := int(math.Round(float64(rect.Height)))
+	top := atlasBounds.Dy() - int(math.Round(float64(rect.Y))) - height
+
+	cropRect := image.Rect(left, top, left+width, top+height)
+	clamped := cropRect.Intersect(atlasBounds)
+	if clamped.Empty() {
+		return nil, nil, image.Rectangle{}, fmt.Errorf("sprite texture rect %v does not intersect atlas bounds %v", cropRect, atlasBounds)
+	}
+	if clamped != cropRect {
+		log.Warnf("sprite %q texture rect %v clamped to atlas bounds %v", sprite.Name, cropRect, atlasBounds)
+	}
+
+	cropped := imageCropNRGBA(atlasNRGBA, clamped)
+
+	if sprite.RenderData.SettingsRaw != nil {
+		switch sprite.RenderData.SettingsRaw.PackingRotation {
+		case uni.SPRFlipHorizontal:
+			cropped = imageFlipHorizontalNRGBA(cropped)
+		case uni.SPRFlipVertical:
+			cropped = unityFlipVerticalNRGBA(cropped)
+		case uni.SPRRotate180:
+			cropped = imageFlipHorizontalNRGBA(unityFlipVerticalNRGBA(cropped))
+		case uni.SPRRotate90:
+			cropped = imageRotate90ClockwiseNRGBA(cropped)
+		}
+	}
+
+	return cropped, textureObject, atlasBounds, nil
+}
+
+// imageCropNRGBA copies out a sub-rectangle into a new, independently-backed image. rect must
+// already be clamped to src's bounds.
+func imageCropNRGBA(src *image.NRGBA, rect image.Rectangle) *image.NRGBA {
+	out := image.NewNRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+	rowSize := rect.Dx() * 4
+	for y := 0; y < rect.Dy(); y++ {
+		srcStart := (rect.Min.Y+y)*src.Stride + rect.Min.X*4
+		dstStart := y * out.Stride
+		copy(out.Pix[dstStart:dstStart+rowSize], src.Pix[srcStart:srcStart+rowSize])
+	}
+	return out
+}
+
+// imageFlipHorizontalNRGBA mirrors an image left-right, undoing SpritePackingRotation.FlipHorizontal.
+func imageFlipHorizontalNRGBA(src *image.NRGBA) *image.NRGBA {
+	bounds := src.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	out := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		srcRowStart := (bounds.Min.Y + y) * src.Stride
+		dstRowStart := y * out.Stride
+		for x := 0; x < width; x++ {
+			srcIdx := srcRowStart + (bounds.Min.X+x)*4
+			dstIdx := dstRowStart + (width-1-x)*4
+			copy(out.Pix[dstIdx:dstIdx+4], src.Pix[srcIdx:srcIdx+4])
+		}
+	}
+	return out
+}
+
+// imageRotate90ClockwiseNRGBA rotates an image 90 degrees clockwise, undoing
+// SpritePackingRotation.Rotate90 (the atlas packer rotates a sprite 90 degrees counter-clockwise
+// to fit it more tightly; this is the inverse). Output width/height are swapped from the input.
+func imageRotate90ClockwiseNRGBA(src *image.NRGBA) *image.NRGBA {
+	bounds := src.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	out := image.NewNRGBA(image.Rect(0, 0, height, width))
+	for y := 0; y < height; y++ {
+		srcRowStart := (bounds.Min.Y + y) * src.Stride
+		for x := 0; x < width; x++ {
+			srcIdx := srcRowStart + (bounds.Min.X+x)*4
+			dstX := height - 1 - y
+			dstY := x
+			dstIdx := dstY*out.Stride + dstX*4
+			copy(out.Pix[dstIdx:dstIdx+4], src.Pix[srcIdx:srcIdx+4])
+		}
+	}
+	return out
+}
+
+// unitySpriteMeta is the sidecar record for one cropped sprite, written to <bundle>.sprites.json
+// alongside the PNGs. It is the only surviving link between a filename and where it came from --
+// without it, PathID, atlas membership, rect/pivot/packing data are all discarded once the PNG is
+// written.
+type unitySpriteMeta struct {
+	Name            string  `json:"name"`
+	PathID          int64   `json:"pathId"`
+	TextureName     string  `json:"textureName"`
+	AtlasWidth      int     `json:"atlasWidth"`
+	AtlasHeight     int     `json:"atlasHeight"`
+	RectX           float32 `json:"rectX"`
+	RectY           float32 `json:"rectY"`
+	RectWidth       float32 `json:"rectWidth"`
+	RectHeight      float32 `json:"rectHeight"`
+	OffsetX         float32 `json:"offsetX"`
+	OffsetY         float32 `json:"offsetY"`
+	PivotX          float32 `json:"pivotX"`
+	PivotY          float32 `json:"pivotY"`
+	PackingRotation string  `json:"packingRotation"`
+	PixelsToUnits   float32 `json:"pixelsToUnits"`
+	OutputFile      string  `json:"outputFile"`
+}
+
+func unitySpriteMetaFrom(sprite *uni.Sprite, atlasTexture *uni.Texture2D, atlasBounds image.Rectangle, outputPath string, targetDir string) unitySpriteMeta {
+	meta := unitySpriteMeta{
+		Name:          sprite.Name,
+		PathID:        sprite.GetObject().PathID,
+		AtlasWidth:    atlasBounds.Dx(),
+		AtlasHeight:   atlasBounds.Dy(),
+		PixelsToUnits: sprite.PixelsToUnits,
+	}
+	if atlasTexture != nil {
+		meta.TextureName = atlasTexture.Name
+	}
+	if sprite.RenderData != nil && sprite.RenderData.TextureRect != nil {
+		meta.RectX = sprite.RenderData.TextureRect.X
+		meta.RectY = sprite.RenderData.TextureRect.Y
+		meta.RectWidth = sprite.RenderData.TextureRect.Width
+		meta.RectHeight = sprite.RenderData.TextureRect.Height
+	}
+	if sprite.Offset != nil {
+		meta.OffsetX = sprite.Offset.X
+		meta.OffsetY = sprite.Offset.Y
+	}
+	if sprite.Pivot != nil {
+		meta.PivotX = sprite.Pivot.X
+		meta.PivotY = sprite.Pivot.Y
+	}
+	if sprite.RenderData != nil && sprite.RenderData.SettingsRaw != nil {
+		meta.PackingRotation = packingRotationString(sprite.RenderData.SettingsRaw.PackingRotation)
+	}
+	if rel, err := filepath.Rel(targetDir, outputPath); err == nil {
+		meta.OutputFile = rel
+	} else {
+		meta.OutputFile = outputPath
+	}
+	return meta
+}
+
+func packingRotationString(rotation uni.SpritePackingRotation) string {
+	switch rotation {
+	case uni.SPRNone:
+		return "none"
+	case uni.SPRFlipHorizontal:
+		return "flipHorizontal"
+	case uni.SPRFlipVertical:
+		return "flipVertical"
+	case uni.SPRRotate180:
+		return "rotate180"
+	case uni.SPRRotate90:
+		return "rotate90"
+	default:
+		return "unknown"
+	}
+}
+
+func unityWriteSpriteSidecar(bundleName string, targetDir string, metas []unitySpriteMeta) error {
+	base := strings.TrimSuffix(bundleName, filepath.Ext(bundleName))
+	path := filepath.Join(targetDir, base+".sprites.json")
+
+	data, err := json.MarshalIndent(metas, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, os.ModePerm)
 }
 
 func unityDecodeTextureImage(texture *uni.Texture2D, hintWidth int, hintHeight int) (image.Image, error) {
@@ -395,12 +582,19 @@ func unityImageResolutionSubdir(bundleName string) string {
 		return ""
 	}
 
+	// Real Unity resolution-variant suffixes are single-digit multipliers (1x/2x/4x/8x, e.g.
+	// "item_assets_1"). The naive "any trailing digit run" version of this check misread
+	// numeric asset IDs as resolution tags -- "prop_10008" produced a bogus "10008x" subdirectory
+	// -- because a multi-digit ID looks identical to a resolution tag under a plain isOnlyDigits
+	// test. Restricting to the four known multipliers fixes that without needing to enumerate
+	// every category's naming convention.
 	resolutionID := base[lastUnderscore+1:]
-	if !isOnlyDigits(resolutionID) {
+	switch resolutionID {
+	case "1", "2", "4", "8":
+		return resolutionID + "x"
+	default:
 		return ""
 	}
-
-	return resolutionID + "x"
 }
 
 func unityOutputImageName(assetName string, fallback string) string {
